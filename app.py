@@ -4,12 +4,13 @@
 import re
 import streamlit as st
 from google import genai
-from google.genai import types
+from google.genai import types, errors
 
 # ------------------------------------------------------------
 # 1. Settings you can change
 # ------------------------------------------------------------
-MODEL = "gemini-2.5-flash"   # If Google renames the model, change only this line.
+# Pie Bot tries these models in order. If Google retires one, the next one is used.
+MODELS = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"]
 GREETING = ("Hi, I'm Pie Bot! I'm the new member of your group. "
             "Let's find the main idea of Enemy Pie together. Are you ready?")
 
@@ -165,15 +166,37 @@ def ask_pie_bot(group):
         history.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
     # Gemini wants the conversation to start with a user turn
     history.insert(0, types.Content(role="user", parts=[types.Part(text="(The group opened the chat.)")]))
-    response = get_client().models.generate_content(
-        model=MODEL,
-        contents=history,
-        config=types.GenerateContentConfig(
-            system_instruction=rules(group, progress_text()),
-            temperature=0.6,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=rules(group, progress_text()),
+        temperature=0.6,
     )
-    return response.text or ""
+    last_error = None
+    for model in MODELS:
+        try:
+            response = get_client().models.generate_content(model=model, contents=history, config=config)
+            return response.text or ""
+        except errors.ClientError as e:
+            last_error = e
+            if getattr(e, "code", None) == 404:   # model not found -> try the next one
+                continue
+            raise
+    raise last_error
+
+def explain(e):
+    """Turn a Gemini error into a short note for the teacher."""
+    code = getattr(e, "code", None)
+    msg = str(getattr(e, "message", "") or e)[:300]
+    if code == 400 and "API key" in msg:
+        hint = "The API key is wrong. Copy the key again into Secrets (no spaces)."
+    elif code in (401, 403):
+        hint = "This key is not allowed to use Gemini. Make a new key in Google AI Studio."
+    elif code == 404:
+        hint = "Google could not find the model. Add a newer model name to MODELS."
+    elif code == 429:
+        hint = "The free limit is used up for now. Wait a minute (or until tomorrow)."
+    else:
+        hint = "See the message below."
+    return f"{hint}\n\nError {code}: {msg}"
 
 # ------------------------------------------------------------
 # 7. Screen
@@ -232,10 +255,15 @@ if user_text:
         with st.spinner("Pie Bot is thinking..."):
             try:
                 answer = ask_pie_bot(group or "the group")
+            except KeyError:
+                ss.messages.pop()
+                st.error("The API key is missing. In Streamlit, open Settings > Secrets and add GEMINI_API_KEY.")
+                st.stop()
             except Exception as e:
                 ss.messages.pop()
-                st.error("Pie Bot lost the connection. Try again in a minute.")
-                st.caption(f"(for the teacher: {type(e).__name__})")
+                st.error("Pie Bot could not answer. Ask your teacher.")
+                with st.expander("For the teacher: why it failed"):
+                    st.code(explain(e), language=None)
                 st.stop()
         st.write(strip_tags(answer) or "Hmm, can you say that again?")
     ss.messages.append({"role": "assistant", "content": answer})
