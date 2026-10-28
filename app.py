@@ -8,6 +8,7 @@ import time
 import streamlit as st
 from google import genai
 from google.genai import types, errors
+from shared import board, upsert_post, split_twist, clean_handle, clean_tags
 
 # ============================================================
 # 1. Settings you can change
@@ -74,7 +75,27 @@ DRAFTS = {
 CHECKS = ["Surprising?", "Makes sense?", "Connects?", "Past tense?"]
 
 # Each task: what students see + what Pie Bot must do + which role leads each step
+PARTS = [("character", "Character"), ("background", "Background"), ("conflict", "Conflict"), ("twist", "Plot twist")]
+VERDICT = {"right": "✅ Right", "close": "🟡 Close", "wrong": "❌ Wrong"}
+
 TASKS = {
+    "open": {
+        "label": "0 · Open the envelope",
+        "intro": "Open the class predictions from the pre-reading. Were they right? Prove it with the story!",
+        "lead": "Idea banker reads a prediction · everyone looks for the words in the story · Writer marks right / close / wrong",
+        "rules": """TASK: OPEN THE ENVELOPE (checking the class predictions from the pre-reading)
+Before reading, the class predicted four parts of the story. They are in GROUP WORK below.
+Go through them ONE AT A TIME, in this order: Character -> Background -> Conflict -> Plot twist.
+For each one:
+1. Read the prediction aloud (quote it) and ask: "Was it right, close, or wrong? Find the words in the story that show it."
+2. If they ask where to look, give only a paragraph number (you are the Word searcher).
+3. Accept a verdict only when a member points to the sentence in the story. If the verdict does not match the story, ask them to read that paragraph again.
+4. Then praise them and move on to the next part.
+Facts for you (do NOT tell them; use them to check): Character = the narrator ("I"), Jeremy Ross, Stanley, Dad (paragraphs 1-3). Background = summer, the neighborhood, the narrator's tree house (paragraphs 1-2, 5). Conflict = Jeremy laughed at him in a baseball game and didn't invite him to the trampoline party, so Jeremy went on his enemy list (paragraphs 1-2).
+Plot twist: the middle of the story is missing, so they can only compare with the ENDING in paragraph 6 (Jeremy invited him to play; "I just lost my best enemy" - the enemy became a friend). Ask: "Did the story end the way you predicted? Was it a surprise?" Never tell what happened in the missing middle; say "You will write that part later!"
+If a prediction is empty, ask the group to make a quick prediction now, then check it.
+Tag: <<pred:PART:VERDICT>> when a verdict is proven, PART = character / background / conflict / twist, VERDICT = right / close / wrong.""",
+    },
     "main": {
         "label": "1 · Main Idea (p.3)",
         "intro": "Collect the 4 pie pieces with evidence, then write the main idea.",
@@ -151,6 +172,7 @@ defaults = {
     "setup_done": False, "group": "Group 1", "members": [],
     "messages": [], "talk": {}, "last_speaker": None,
     "got": set(), "fixed": set(), "idea": "", "rated": False, "twist_ok": False,
+    "preds": {"character": "", "background": "", "conflict": "", "twist": ""}, "pred_check": {},
     "hint_level": 0, "unlocked": False,
     "ratings": {}, "best": "", "best_reason": "",
     "plan": {"expect": "", "actually": "", "clue": "", "ending": ""}, "paragraph": "",
@@ -171,9 +193,24 @@ def apply_tags(text):
     if m: ss.idea = m.group(1).strip()
     if "<<rated>>" in text: ss.rated = True
     if "<<twist_ok>>" in text: ss.twist_ok = True
+    for m in re.finditer(r"<<pred:\s*(character|background|conflict|twist)\s*:\s*(right|close|wrong)>>", text, re.I):
+        ss.pred_check[m.group(1).lower()] = m.group(2).lower()
+
+def parse_predictions(raw):
+    """Read the text copied from the pre-reading 'Seal' screen: 'Character: ... (2 stars)'."""
+    out = {}
+    for line in raw.splitlines():
+        m = re.match(r"\s*(Character|Background|Conflict|Plot twist)\s*:\s*(.*)$", line, re.I)
+        if m:
+            key = {"plot twist": "twist"}.get(m.group(1).lower(), m.group(1).lower())
+            text = re.sub(r"\(\s*\d\s*stars?\s*\)\s*$", "", m.group(2)).strip()
+            out[key] = "" if text == "-" else text
+    return out
 
 def slices_done():
-    return {"main": bool(ss.idea), "detective": len(ss.fixed) == 5, "rate": ss.rated, "twist": ss.twist_ok}
+    return {"open": len(ss.pred_check) == 4, "main": bool(ss.idea), "detective": len(ss.fixed) == 5,
+            "rate": ss.rated, "twist": ss.twist_ok}
+BAKERY = ["main", "detective", "rate", "twist"]
 
 # ============================================================
 # 4. Pie Bot's instructions
@@ -185,6 +222,8 @@ def team_text():
     return "\n".join(lines)
 
 def work_text(task):
+    if task == "open":
+        return "\n".join(f"{label}: {ss.preds.get(k) or '(empty)'}  -> checked: {ss.pred_check.get(k, 'not yet')}" for k, label in PARTS)
     if task == "rate":
         rows = [f"Draft {d}: " + ", ".join(f"{c} {ss.ratings.get((d, c), '-')}" for c in CHECKS) for d in DRAFTS]
         return "\n".join(rows) + f"\nBest draft: {ss.best or '-'} / Reason: {ss.best_reason or '-'}"
@@ -232,7 +271,7 @@ GROUP WORK SO FAR
 {work_text(task)}
 
 PROGRESS TAGS: At the very END of your reply, on its own line, add tags only for what was completed IN THIS REPLY. Students do not see tags. No tag if nothing new.
-ALREADY DONE (do not award again): pieces {sorted(ss.got) or 'none'}; mistakes fixed {sorted(ss.fixed) or 'none'}; main idea {ss.idea or 'not yet'}; twist check {'done' if ss.rated else 'not yet'}; our twist {'ok' if ss.twist_ok else 'not yet'}."""
+ALREADY DONE (do not award again): pieces {sorted(ss.got) or 'none'}; mistakes fixed {sorted(ss.fixed) or 'none'}; main idea {ss.idea or 'not yet'}; twist check {'done' if ss.rated else 'not yet'}; our twist {'ok' if ss.twist_ok else 'not yet'}; predictions checked {ss.pred_check or 'none'}."""
 
 # ============================================================
 # 5. Optional class code (so strangers can't use your free quota)
@@ -324,10 +363,14 @@ def explain(e):
 done = slices_done()
 with st.sidebar:
     st.header(f"🥧 {ss.group}")
+    st.subheader("✉️ Envelope")
+    for k, label in PARTS:
+        st.markdown(f"{VERDICT.get(ss.pred_check.get(k), '⬜ not yet')} · {label}")
+    st.divider()
     st.subheader("Our Pie Bakery")
-    for k in TASK_KEYS:
+    for k in BAKERY:
         st.markdown(("🟥 " if done[k] else "⬜ ") + TASKS[k]["label"])
-    st.progress(sum(done.values()) / 4)
+    st.progress(sum(done[k] for k in BAKERY) / 4)
     st.caption(f"Pieces: {len(ss.got)}/4 · Mistakes fixed: {len(ss.fixed)}/5")
     if ss.idea: st.markdown(f"**Main idea:** {ss.idea}")
     st.divider()
@@ -355,6 +398,26 @@ st.caption("Who leads: " + t["lead"])
 with st.expander("📖 Read the story"):
     for n_, p in numbered_story():
         st.markdown(f"**{n_}.** {p}" if n_ else f"*… {p}*")
+
+# the envelope (class predictions)
+if task == "open":
+    with st.container(border=True):
+        st.markdown("**✉️ Our class predictions**")
+        raw = st.text_area("Paste the predictions from the pre-reading (Copy predictions), or type them.",
+                           key="pred_paste", height=120,
+                           placeholder="Our predictions:\nCharacter: ...\nBackground: ...\nConflict: ...\nPlot twist: ...")
+        if st.button("Open the envelope", type="primary"):
+            parsed = parse_predictions(raw)
+            if parsed:
+                ss.preds.update(parsed); ss.pred_check = {}
+            else:
+                st.warning("I can't read it. Write one line per part, like 'Character: a new boy'.")
+        cols = st.columns(4)
+        for (k, label), col in zip(PARTS, cols):
+            with col:
+                st.markdown(f"**{label}**")
+                st.write(ss.preds.get(k) or "—")
+                st.caption(VERDICT.get(ss.pred_check.get(k), "not checked yet"))
 
 # worksheet boxes for p.5 and p.6
 if task == "rate":
@@ -388,6 +451,28 @@ if task == "twist":
                                     key="p_par", height=180)
         st.markdown("*Jeremy invited me over to his house. I lost my best enemy. Enemy pie turned the enemy into my friend.*")
         st.caption(f"Sentences: {len([s for s in re.split(r'[.!?]+', ss.paragraph) if s.strip()])}")
+    with st.container(border=True):
+        st.markdown("**📸 Share on PieGram** · Writer only, when your paragraph is ready")
+        ss.setdefault("pg_handle", "")
+        a, b = st.columns(2)
+        handle_in = a.text_input("Group account name (your Bakery name)", value=ss.pg_handle or "@" + re.sub(r"\W+", "_", ss.group.lower()), key="pg_handle_in", max_chars=24)
+        tags_in = b.text_input("3 hashtags", key="pg_tags_in", placeholder="#BestEnemy #ToMySurprise #EnemyCookies")
+        if st.button("📸 Post to PieGram", type="primary"):
+            parts = split_twist(ss.paragraph)
+            if not parts:
+                st.error("Start your twist with 'To my surprise,' or 'But actually,' so PieGram knows where the surprise begins.")
+            elif not clean_tags(tags_in):
+                st.error("Add your 3 hashtags first.")
+            else:
+                h = clean_handle(handle_in)
+                ok, msg = upsert_post(h, parts[0], parts[1], clean_tags(tags_in), old_handle=ss.pg_handle)
+                if ok:
+                    ss.pg_handle = h
+                    st.success(f"{msg} Your account: {h}. You can post again to update it until the feed opens.")
+                else:
+                    st.error(msg)
+        elif ss.pg_handle:
+            st.caption(f"Posted as {ss.pg_handle} ✓ (post again to update)")
 
 # chat history
 for m in ss.messages:
@@ -401,7 +486,8 @@ for m in ss.messages:
 # who is talking + quick buttons
 labels = [f"{m['name']} · {m['role']}" for m in ss.members]
 speaker = st.radio("Who is talking? (choose every time)", labels, horizontal=True, key="speaker", index=None)
-starters = {"main": ("Let's start!", "Let's find the main idea!"), "detective": ("Show your summary", "Show your summary"),
+starters = {"open": ("Let's check!", "We opened the envelope. Let's check our predictions!"),
+            "main": ("Let's start!", "Let's find the main idea!"), "detective": ("Show your summary", "Show your summary"),
             "rate": ("Let's start!", "Let's rate the drafts!"), "twist": ("Check our twist", "Please check our twist.")}
 c1, c2, c3 = st.columns(3)
 quick = None
