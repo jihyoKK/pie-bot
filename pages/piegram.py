@@ -9,45 +9,21 @@ import random
 import threading
 import uuid
 import streamlit as st
+from shared import REACTIONS, BOT_POSTS, new_post, board, upsert_post, clean_handle, clean_tags
 
 st.set_page_config(page_title="PieGram", page_icon="📸", layout="wide")
 
 # ============================================================
 # 1. Settings
 # ============================================================
-REACTIONS = {"wow": "😱 Surprised", "lol": "🤣 Funny", "clue": "🕵️ Found the clue"}
 COMMENT_FRAMES = ["I didn't expect ___!", "The clue was ___.", "My favorite part was ___.", "I think this is AI because ___."]
 CARD_NAMES = {1: "Profile", 2: "Setup", 3: "What happens next?", 4: "Twist!"}
-# Two AI-written twists hidden in the feed (setup, twist, hashtags, handle)
-BOT_POSTS = [
-    ("@sugar_rush_bakery",
-     "Dad sent me to Jeremy's house to borrow some sugar. Jeremy's mom opened the door. Behind her, I saw a big photo on the wall.",
-     "It was our baseball team, and Jeremy drew a circle around my face! Jeremy said, \"I wanted to be your friend, but I didn't know how.\" I was so surprised that I forgot about the sugar.",
-     ["#SecretFan", "#ToMySurprise", "#Sugar"]),
-    ("@midnight_crust",
-     "Dad finished the pie and gave me a letter. \"Give this to Jeremy,\" he said. I opened it on the way.",
-     "It was a dinner invitation, and my name was at the bottom! I was angry, but I knocked on Jeremy's door. Jeremy read the letter and smiled. \"I thought you hated me,\" he said. \"I'm sorry about the baseball game.\"",
-     ["#Invitation", "#Sorry", "#PlotTwist"]),
-]
 START_LINE = "I was wondering what dirty thing I had to put in the pie."
 END_LINE = "Jeremy invited me over to his house. I lost my best enemy."
 
 # ============================================================
 # 2. The shared board (one per app, shared by every student)
 # ============================================================
-def new_post(handle, setup, twist, tags, is_bot=False):
-    return {"id": uuid.uuid4().hex[:8], "handle": handle, "setup": setup, "twist": twist, "tags": tags,
-            "bot": is_bot, "react": {k: set() for k in REACTIONS}, "bot_votes": set(), "comments": [],
-            "guesses": [], "saw": {"yes": set(), "no": set()}, "label": ""}
-
-@st.cache_resource
-def board():
-    b = {"lock": threading.Lock(), "posts": {}, "phase": "posting", "now": None, "card": 1}
-    for h, s_, t_, tags in BOT_POSTS:
-        p = new_post(h, s_, t_, tags, True)
-        b["posts"][p["id"]] = p
-    return b
-
 B = board()
 ss = st.session_state
 ss.setdefault("me", "")
@@ -212,22 +188,16 @@ def post_form():
         tags = st.text_input("3 hashtags that sum up your twist", value=" ".join((mine or {}).get("tags", [])), placeholder="#BestEnemy #ToMySurprise #EnemyCookies")
         sent = st.form_submit_button("Post", type="primary")
     if sent:
-        h = handle.strip()
-        h = h if h.startswith("@") else "@" + h
-        tag_list = [t if t.startswith("#") else "#" + t for t in tags.replace(",", " ").split() if t.strip("#")][:3]
+        h = clean_handle(handle)
         if len(h) < 3 or not setup.strip() or not twist.strip():
             st.error("Fill in the account name and both parts.")
-        elif any(p["handle"].lower() == h.lower() and p is not mine for p in all_posts()):
-            st.error("That account name is taken. Choose another.")
         else:
-            with B["lock"]:
-                if mine:
-                    mine.update({"handle": h, "setup": setup.strip(), "twist": twist.strip(), "tags": tag_list})
-                else:
-                    p = new_post(h, setup.strip(), twist.strip(), tag_list)
-                    B["posts"][p["id"]] = p
-            ss.my_handle = h
-            st.success("Posted! Wait for the teacher to drop the feed.")
+            ok, msg = upsert_post(h, setup.strip(), twist.strip(), clean_tags(tags), old_handle=ss.my_handle)
+            if ok:
+                ss.my_handle = h
+                st.success(msg + " Wait for the teacher to drop the feed.")
+            else:
+                st.error(msg)
 
 def toggle(sset):
     with B["lock"]:
